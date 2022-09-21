@@ -140,7 +140,7 @@ def get_sptr_by_name(struct_name):
 def set_func_name(func_ea, func_name):
     counter = 0
     new_name = func_name
-    while not ida_name.set_name(func_ea, new_name):
+    while not ida_name.set_name(func_ea, new_name) and counter < 20:
         new_name = func_name + "_%d" % counter
         counter += 1
     return new_name
