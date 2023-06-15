@@ -79,5 +79,5 @@ The same goes for **virutal function prototype changing**. In this case, the rel
 
 # Meta
 
-Authored by Uriel Malin and Ievgen Solodovnykov of Cellebrite Labs. 
-Developed and tested for IDA8.0 on macOS with python 3.10.2
+Authored by Uriel Malin, Ievgen Solodovnykov and Omer Porzecanski of Cellebrite Labs.
+Developed and tested for IDA8.3 on macOS with python 3.10.2
