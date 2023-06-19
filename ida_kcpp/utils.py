@@ -9,8 +9,9 @@ import ida_nalt
 import ida_name
 import ida_struct
 import ida_typeinf
+import idaapi
 import idc
-
+from ida_kernelcache import symbol
 
 def batch_mode(func):
     def wrapper(*args, **kwargs):
@@ -24,9 +25,12 @@ def batch_mode(func):
 
 
 def generate_method_name(classname, methodname):
+    # TODO: this is a temp solution to have templated classes names resolved well. Need a permanent one.
+    new_class_part = symbol.global_name(classname).replace("__ZN", "").replace("__Z", "") 
+    
     # the "_99" is a marker which IDA ignores and will let us identify self-generated mangled names
-    return "__ZNK{}{}{}{}Ev_99".format(
-        len(classname), classname, len(methodname), methodname
+    return "__ZNK{}{}{}Ev_99".format(
+        new_class_part, len(methodname), methodname
     )
 
 
@@ -80,9 +84,7 @@ def duplicate_details_with_this(method_details, this_type):
 
 def get_struc_from_tinfo(struct_tinfo):
 
-    if ida_hexrays.init_hexrays_plugin() and (
-        not (struct_tinfo.is_struct() or struct_tinfo.is_union())
-    ):
+    if not (struct_tinfo.is_struct() or struct_tinfo.is_union()):
         return None
     struct_id = ida_struct.get_struc_id(struct_tinfo.get_type_name())
     if struct_id == ida_idaapi.BADADDR:
@@ -159,7 +161,7 @@ def get_member_substruct(member):
 def get_member_tinfo(member, member_typeinf=None):
     if member_typeinf is None:
         member_typeinf = ida_typeinf.tinfo_t()
-    ida_struct.get_member_tinfo(member_typeinf, member)
+    ida_struct.get_or_guess_member_tinfo(member_typeinf, member)
     return member_typeinf
 
 
@@ -194,3 +196,12 @@ def is_func_start(ea):
     if func:
         return func.start_ea == ea
     return False
+
+
+def add_struct_substruct_member(sptr, new_member_name, offset, substruct_id):
+    flag = idaapi.FF_STRUCT
+    mt = ida_nalt.opinfo_t()
+    mt.tid = substruct_id
+    member_size = ida_struct.get_struc_size(substruct_id)
+    ida_struct.del_struc_members(sptr, offset, offset + member_size)
+    return ida_struct.add_struc_member(sptr, new_member_name, offset, flag, mt, member_size)

@@ -5,6 +5,7 @@ import subprocess
 
 import netnode
 
+import ida_auto
 import ida_bytes
 import ida_hexrays
 import ida_idaapi
@@ -31,10 +32,6 @@ def init_if_needed(only_collect=True):
     import ida_kernelcache
     import ida_kernelcache.classes
     import ida_kernelcache.ida_utilities
-    if only_collect:
-        ida_kernelcache.collect_class_info()
-    else:
-        ida_kernelcache.kernelcache_process()
 
     global logger
 
@@ -56,6 +53,11 @@ def init_if_needed(only_collect=True):
     # Add handlers to the logger
     logger.addHandler(c_handler)
     logger.addHandler(f_handler)
+
+    if only_collect:
+        ida_kernelcache.collect_class_info()
+    else:
+        ida_kernelcache.kernelcache_process()
 
     global vfunc_to_vmethod
     vfunc_to_vmethod = netnode.Netnode("$ ida_kcpp.vfunc_to_vmethod")
@@ -351,3 +353,93 @@ def get_member_id_for_vfunc(ea, func_metadata):
         if mid == ida_idaapi.BADADDR:
             return
         return mid
+
+
+def shrink_struct(name, how_much):
+    if how_much == 0:
+        return
+
+    sptr = utils.get_sptr_by_name(name)
+    if not sptr:
+        raise RuntimeError("struct {name} does not exist")
+    curr_size = ida_struct.get_struc_size(sptr)
+    assert how_much < curr_size
+
+    new_size = curr_size - how_much
+
+    # remove last members
+    ida_struct.del_struc_members(sptr, new_size, curr_size + 1)
+    curr_size = ida_struct.get_struc_size(sptr)
+    assert curr_size <= new_size
+
+    # add padding member if required
+    if curr_size < new_size:
+        ida_struct.add_struc_member(sptr, None, new_size - 1, 0, None, 1)
+
+    # verify that we're alright
+    assert ida_struct.get_struc_size(sptr) == new_size
+    return sptr
+
+
+def get_fields_member_in_iokit_class(class_name):
+    class_sptr = utils.get_sptr_by_name(class_name)
+    fields_member = ida_struct.get_member_by_name(class_sptr, class_name)
+    if not fields_member:
+        raise RuntimeError(f"Class {class_name} does not have {class_name} member")
+    member_tinfo = utils.get_member_tinfo(fields_member)
+    expected_fields_name = class_name + "::fields"
+    if not (member_tinfo.is_struct() and member_tinfo.get_type_name() == expected_fields_name):
+        raise RuntimeError(f"member {class_name}.{class_name} isn't of type {class_name}::fields")
+    return fields_member
+
+
+def fix_containing_struct(class_name, fields_member_offset, next_member_offset, fields_sptr):
+    sptr = utils.get_sptr_by_name(class_name)
+    if not sptr:
+        return
+    fields_class_name = ida_struct.get_struc_name(fields_sptr.id)[:-len("::fields")]
+    utils.add_struct_substruct_member(sptr, fields_class_name, fields_member_offset, fields_sptr.id)
+    next_member = ida_struct.get_member(sptr, next_member_offset)
+    if next_member:
+        next_member_fields = utils.get_struc_from_tinfo(utils.get_member_tinfo(next_member))
+        if not next_member_fields:
+            return
+        next_member_name = ida_struct.get_member_name(next_member.id)
+        return sptr, next_member_name, next_member_fields
+
+
+def shrink_iokit_class(class_name, how_much):
+    if how_much == 0:
+        return
+
+    if class_name not in ida_kernelcache.class_info:
+        raise NameError(f"no such class_info: {class_name}")
+
+    fields_member = get_fields_member_in_iokit_class(class_name)
+    fields_member_offset = fields_member.soff
+    next_member_offset = fields_member.soff + fields_member.get_size()
+    old_auto_analysis_status = ida_auto.enable_auto(False)
+    fields_sptr = shrink_struct(class_name + "::fields", how_much)
+    fix_containing_struct(class_name, fields_member_offset, next_member_offset, fields_sptr)
+
+    expanded_fields = set()
+    structs_to_fix = []
+
+    class_info = ida_kernelcache.class_info[class_name]
+    for descendant in class_info.descendants():
+        to_fix = fix_containing_struct(descendant.classname, fields_member_offset, next_member_offset, fields_sptr)
+        if to_fix:
+            structs_to_fix.append(to_fix)
+
+    next_member_new_offset = fields_member_offset + ida_struct.get_struc_size(fields_sptr)
+    for sptr, member_name, next_member_fields in structs_to_fix:
+        if next_member_fields.id not in expanded_fields:
+            expanded_fields.add(next_member_fields.id)
+            old_struct_size = ida_struct.get_struc_size(next_member_fields)
+            ida_struct.del_struc_member(next_member_fields, old_struct_size)
+            if ida_struct.get_struc_size(next_member_fields) < old_struct_size:
+                ida_struct.add_struc_member(next_member_fields, None, old_struct_size - 1, 0, None, 1)
+            ida_struct.expand_struc(next_member_fields, 0, how_much)
+        utils.add_struct_substruct_member(sptr, member_name, next_member_new_offset, next_member_fields.id)
+
+    ida_auto.enable_auto(old_auto_analysis_status)
