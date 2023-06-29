@@ -2,7 +2,7 @@ import logging
 
 import ida_kernwin
 import idaapi
-from ida_kcpp import logic, ui, ui_utils
+from ida_kcpp import ui_utils
 
 
 class KCPPPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
@@ -37,11 +37,15 @@ class KCPPPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
             return idaapi.PLUGIN_SKIP
 
         if not self.plugin_initialized:
+            logging.info(f"{self.wanted_name}: IDB deemed suitable. Initializing...")
+            global logic
+            global ui
+            from ida_kcpp import logic, ui
             self.init_menu_items()
 
             self.ui_hook = True
             self.hook()
-            logging.info(f"{self.wanted_name}: IDB deemed suitable. Initializing...")
+
 
         return idaapi.PLUGIN_KEEP
 
