@@ -6,6 +6,7 @@ import ida_moves
 import ida_name
 import ida_struct
 import ida_typeinf
+import idaapi
 
 from . import logic, ui_utils, utils
 
@@ -50,7 +51,7 @@ def jump_to_virtual_func(ancestor_name, offset_in_vtable):
             virtual_func_formatted = "0x%016X" % virtual_func
             func_name = ida_name.get_ea_name(virtual_func)
             func_class_name, method_name = utils.parse_mangled_method_name(func_name)
-            if class_name:
+            if func_class_name:
                 func_name = func_class_name + "::" + method_name
             prepared_data.append((class_name, func_name, virtual_func_formatted))
         if len(functions_set) > 1:
@@ -78,20 +79,53 @@ class VirtualFuncsSynchronizer(ida_idp.IDB_Hooks):
             else:
                 class_name, method_name = utils.parse_mangled_method_name(new_name)
                 if class_name is None:
-                    return
+                    # Case only actual method name was assigned without class prefix
+                    if ea not in logic.vfunc_to_vmethod:
+                        return
+                    vfunc_metadata = logic.VFuncMetadata(*logic.vfunc_to_vmethod[ea])
+                    class_name = vfunc_metadata.impl_class
+                    method_name = new_name
+                    full_name = utils.generate_method_name(class_name, method_name)
+                    utils.set_func_name(ea, full_name)
                 self.unhook()
             logic.virtual_method_renamed(ea, class_name, method_name)
             self.hook()
-
-    def renaming_struc_member(self, sptr, mptr, new_name):
-        struc_name = ida_struct.get_struc_name(sptr.id)
-        if not struc_name.endswith("::vmethods"):
+    
+    # TODO: use lt_udm_renamed when porting to ida9
+    def local_types_changed(self, ltc, ordinal, name):
+        # There are two very annoying things about local_types_changed:
+        #   1. the parameters tell you very little about WHAT changed.
+        #      specifically, we can't really tell in which way a struct 
+        #      was edited.
+        #   2. this function hooks in exactly after the change starts
+        #      but before it takes place. So for example if a member is
+        #      modified by the user, the old name/type will still presist
+        #      if this function tries to read them.
+        # So in order to overcome these restrictions, we use
+        # execute_ui_requests to perform the logic of this 
+        # hook only AFTER the renaming/retyping takes place.
+        # ...And instead of updating the functions that match
+        # only the member that was modified, we update the matching
+        # functions for EVERY member.
+        if ltc != ida_idp.LTC_EDITED or not name.endswith("::vmethods"):
             return
+        idaapi.execute_ui_requests([lambda: self._update_vmethods(name)])
+    
+    def _update_vmethods(self, name):
+        sid = ida_struct.get_struc_id(name)
+        sptr = ida_struct.get_struc(sid)
         self.unhook()
-        class_name = struc_name.split("::")[0]
-        logic.virtual_method_member_renamed(class_name, mptr.soff, new_name)
+        class_name = name.split("::")[0]
+        for mptr in sptr.members:
+            vtable_offset = logic.find_own_vmethods_offset_in_vtable(class_name) + mptr.soff
+            generic_method_name = f"method_{vtable_offset // 8}"
+            logic.virtual_method_member_renamed(class_name, mptr.soff, generic_method_name)
+        for mptr in sptr.members:
+            member_name = ida_struct.get_member_name(mptr.id)
+            logic.virtual_method_member_renamed(class_name, mptr.soff, member_name)    
+            logic.virtual_method_member_prototype_changed(class_name, mptr)
         self.hook()
-
+        
     def ti_changed(self, ea, ti_type, ti_fname):
         if not utils.is_func_start(ea):
             return
@@ -101,15 +135,6 @@ class VirtualFuncsSynchronizer(ida_idp.IDB_Hooks):
         tinfo.get_func_details(func_details)
         self.unhook()
         logic.virtual_method_prototype_changed(ea, func_details)
-        self.hook()
-
-    def struc_member_changed(self, sptr, mptr):
-        struc_name = ida_struct.get_struc_name(sptr.id)
-        if not struc_name.endswith("::vmethods"):
-            return
-        class_name = struc_name.split("::")[0]
-        self.unhook()
-        logic.virtual_method_member_prototype_changed(class_name, mptr)
         self.hook()
 
 

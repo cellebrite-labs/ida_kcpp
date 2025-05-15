@@ -1,6 +1,8 @@
 import collections
+import json
 import logging
 import pathlib
+import re
 import subprocess
 
 import netnode
@@ -9,9 +11,12 @@ import ida_auto
 import ida_bytes
 import ida_hexrays
 import ida_idaapi
+import ida_name
 import ida_struct
 import ida_typeinf
 import ida_xref
+import idautils
+import idc
 from . import utils
 
 initialized = False
@@ -185,11 +190,13 @@ def find_own_vmethods_offset_in_vtable(class_name):
     return None
 
 
-def extract_method_name(func_ea):
-    impl_name = ida_kernelcache.ida_utilities.get_ea_name(func_ea)
-    if impl_name == "___cxa_pure_virtual" or impl_name.startswith("nullsub"):
-        return
+def extract_method_name_from_func_ea(func_ea):
     if ida_bytes.has_dummy_name(ida_bytes.get_flags(func_ea)):
+        return
+    return extract_method_name(ida_kernelcache.ida_utilities.get_ea_name(func_ea))
+
+def extract_method_name(impl_name):
+    if impl_name == "___cxa_pure_virtual" or impl_name.startswith("nullsub"):
         return
     mangled_class, method_name = utils.parse_mangled_method_name(impl_name)
     if not (mangled_class or method_name):
@@ -285,9 +292,22 @@ def virtual_method_member_renamed(class_name, vmethod_offset, method_name):
 
 
 def rename_virtual_method(class_name, vtable_offset, vmethod_offset, method_name, set_member_name=True):
+    member_name = method_name
     if set_member_name:
         vmethod_sptr = utils.get_sptr_by_name(class_name + "::vmethods")
-        ida_struct.set_member_name(vmethod_sptr, vmethod_offset, method_name)
+        i = 0
+        for i in range(20):
+            if i > 0:
+                member_name = method_name + "_" + str(i)
+            if ida_struct.set_member_name(vmethod_sptr, vmethod_offset, member_name):
+                break
+        else:
+            logger.warning(f"Couldn't rename f{class_name}::vemthod at offset {hex(vmethod_offset)} to {method_name}")
+            return
+        member = ida_struct.get_member(vmethod_sptr, vmethod_offset)
+        comment = ida_struct.get_member_cmt(member.id, 1)
+        if comment and comment.startswith("Conflicting virtual function name"):
+            ida_struct.set_member_cmt(member, '', 1)
     impls = gather_funcs_from_descendants(class_name, vtable_offset)
     changed_funcs = set()
     for _, impl_ea in impls:
@@ -295,8 +315,10 @@ def rename_virtual_method(class_name, vtable_offset, vmethod_offset, method_name
             impl_name = ida_kernelcache.ida_utilities.get_ea_name(impl_ea)
             impl_orig_class_name, impl_orig_method_name = utils.parse_mangled_method_name(impl_name)
             if not (impl_orig_method_name and impl_orig_class_name):
+                logger.warning(f"Skipping impl with unexpected name: {impl_name}")
                 continue
-            utils.set_func_name(impl_ea, utils.generate_method_name(impl_orig_class_name, method_name))
+            new_impl_name = utils.generate_method_name(impl_orig_class_name, member_name)
+            ida_name.set_name(impl_ea, new_impl_name, ida_name.SN_AUTO | ida_name.SN_FORCE | ida_name.SN_NOWARN)
             changed_funcs.add(impl_ea)
 
 
@@ -443,3 +465,100 @@ def shrink_iokit_class(class_name, how_much):
         utils.add_struct_substruct_member(sptr, member_name, next_member_new_offset, next_member_fields.id)
 
     ida_auto.enable_auto(old_auto_analysis_status)
+
+
+def export_function_symbols(filepath):
+    functions = {}
+    for ea in idautils.Functions():
+        name = idc.get_name(ea)
+        # Check name is user defined
+        if (not idc.hasUserName(ida_bytes.get_full_flags(ea))):
+            continue
+        # ...And that it isn't a "Classname::method_X" default name
+        _, method_name = parse_mangled_method_name(name)
+        if method_name and bool(re.fullmatch(r"method_\d+", method_name)):
+            continue            
+        # ...Nor a InitFunc/TermFunc
+        if '_InitFunc_' in name or '_TermFunc_' in name:
+            continue
+        functions[hex(ea)] = name
+    with open(filepath, "w") as f:
+        json.dump(functions, f)
+
+
+def _load_function_symbol(ea, name):
+    # If ea is not vmethod, rename and return.
+    # In case function already has a user defined name,
+    # chain them together as "option1_OR_option2"
+    if ea not in vfunc_to_vmethod:
+        if idc.hasUserName(ida_bytes.get_full_flags(ea)):
+            existing_name = ida_name.get_ea_name(ea)
+            if existing_name == name: return
+            name += f'_OR_{existing_name}'
+        ida_name.set_name(ea, name, ida_name.SN_AUTO | ida_name.SN_FORCE)
+        return
+    
+    # Using gathered metadata, find the ::vmethods struct this vfunction is defined in.
+    # If the name defined in the struct is method_XX we know this function wasn't RE yet,
+    # and we can change both the ::vmethods member's name and every implementing function's name
+    vfunc_metadata = VFuncMetadata(*vfunc_to_vmethod[ea])
+    vmethods_struct_name = vfunc_metadata.base_class + '::vmethods'
+    sptr = utils.get_sptr_by_name(vmethods_struct_name)
+    if not sptr:
+        logger.warning(f"{vmethods_struct_name} structure not found.")
+        return
+    member = ida_struct.get_member(sptr, vfunc_metadata.vmethod_offset)
+    if not member:
+        logger.warning(f"Could not find struct {vmethods_struct_name} member at offset {vfunc_metadata.vmethod_offset}")
+        return
+    member_name = ida_struct.get_member_name(member.id)
+    sym_method_name = extract_method_name(name)
+    if sym_method_name is None:
+        logger.warning(f"Func {name} in ea {hex(ea)} can't be demangled")
+        return
+    logger.warning(f"{name} demangled into -> {sym_method_name}")
+    # TODO: apply mangled method name on method prototype
+    if (member_name.startswith("method_") and member_name[len("method_"):].isnumeric()):
+        rename_virtual_method(vfunc_metadata.base_class, vfunc_metadata.vtable_offset,
+                              vfunc_metadata.vmethod_offset, sym_method_name, set_member_name=True)
+        return
+
+    # Otherwise, we know ea is a vmethod and it has already been RE in one of the classes in the hierarchy.
+    # So, we change struct member's name to CONFLICT_XX and add a comment that specifies all the collisions.
+    # We also rename all the matching functions in the inheritance tree to classname::CONFLICT_XX
+    # But first, check that we don't apply all this logic in case we "rename" to the current name...
+    if member_name == sym_method_name or sym_method_name == "_".join(member_name.split("_")[:-1]):
+        # if sym_method_name is the same as member_name or member_name_POSTFIX-NUM
+        return
+    vtable_off = vfunc_metadata.vtable_offset
+    word_size = ida_kernelcache.ida_utilities.WORD_SIZE
+    conflict_name = f'CONFLICT_{vtable_off // word_size}'
+    set_member_name = 'CONFLICT_' not in member_name
+    rename_virtual_method(vfunc_metadata.base_class, vfunc_metadata.vtable_offset, 
+                          vfunc_metadata.vmethod_offset, conflict_name, set_member_name)
+    comment = ida_struct.get_member_cmt(member.id, 1)
+    if not comment:
+        comment = 'Conflicting virtual function name with:\n%s @ 0x%x' % (member_name, ea)
+    demangled_name = idc.demangle_name(name, idc.get_inf_attr(idc.INF_LONG_DN))
+    if demangled_name:
+        comment += '\n%s @ 0x%x' % (demangled_name, ea)
+    else:
+        comment += '\n%s @ 0x%x' % (name, ea)
+    ida_struct.set_member_cmt(member, comment, 1)
+    
+def import_function_symbols(filepath):
+    if filepath.endswith(".json"):
+        with open(filepath, "r") as f:
+            functions = json.load(f)
+    elif filepath.endswith(".syms"):
+        with open(filepath, 'r') as f:
+            functions = {}
+            for l in f:
+                comps = l.split(' ')
+                if len(comps) > 1:
+                    addr, name = comps[0].strip(), comps[1].strip()
+                    if not "fn_0x" in name and not name.startswith("sub_"):
+                        functions[addr] = name
+    for addr, name in functions.items():
+        _load_function_symbol(int(addr, 16), name)
+        

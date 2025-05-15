@@ -1,5 +1,4 @@
 import logging
-import re
 
 import ida_bytes
 import ida_funcs
@@ -12,6 +11,7 @@ import ida_typeinf
 import idaapi
 import idc
 from ida_kernelcache import symbol
+
 
 def batch_mode(func):
     def wrapper(*args, **kwargs):
@@ -38,7 +38,15 @@ def parse_mangled_method_name(mangled_name):
     demangled_name = idc.demangle_name(mangled_name, idc.get_inf_attr(idc.INF_LONG_DN))
     if not demangled_name:
         return None, None
-    return re.match(r"(?:(.*)::)?(.*?)\(.*\)", demangled_name).groups()
+    # Now strip arguments list such as in 'OSDictionary::setObject(OSSymbol const*, OSMetaClassBase const*)'
+    strip_args = demangled_name.split("(")[0].split("::")
+    method_name = strip_args[-1]
+    if len(strip_args) < 2:
+        return None, strip_args[0]
+    class_name = "::".join(strip_args[:-1])
+    if method_name[0] == '~' and method_name[1:] == class_name.split("<")[0]:
+        method_name = "dtor"
+    return class_name, method_name
 
 
 # Functions below were copied from ida_medigate

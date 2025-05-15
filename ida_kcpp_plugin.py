@@ -1,5 +1,7 @@
 import logging
 
+import netnode
+
 import ida_kernwin
 import idaapi
 from ida_kcpp import ui_utils
@@ -26,6 +28,7 @@ class KCPPPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
         self.structs_double_colon_hook = None
         # Hotkeys context
         self.vfunc_xref_hotkey = None
+        self.is_activated = False
 
     def init(self):
         """plugin_t init() function"""
@@ -35,16 +38,24 @@ class KCPPPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
         if any(word not in typename for word in typename_markers):
             logging.error(f"{self.wanted_name}: IDB deemed unsuitable (not an ARM64 kernelcache binary). Skipping...")
             return idaapi.PLUGIN_SKIP
-
+        self.activated = False
         if not self.plugin_initialized:
             logging.info(f"{self.wanted_name}: IDB deemed suitable. Initializing...")
             global logic
             global ui
+
+            # noinspection PyUnresolvedReferences
             from ida_kcpp import logic, ui
             self.init_menu_items()
 
             self.ui_hook = True
             self.hook()
+            kcpp_netnode = netnode.Netnode("$ ida_kcpp.vfunc_to_vmethod")
+            if len(kcpp_netnode.keys()) > 0 :
+                self.activate_plugin()
+                self.activated = True
+            else:
+                kcpp_netnode.kill()
 
 
         return idaapi.PLUGIN_KEEP
@@ -54,6 +65,8 @@ class KCPPPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
         self.activate_menu = ui_utils.MenuBase(self, self.activate_plugin, "Activate plugin")
         self.deactivate_menu = ui_utils.MenuBase(self, self.deactivate_plugin, "Deactivate plugin")
         self.initial_sync_menu = ui_utils.MenuBase(self, self.perform_initial_sync, "Perform initial sync")
+        self.export_function_symbols_menu = ui_utils.MenuBase(self, self.export_function_symbols, "Export function symbols")
+        self.import_function_symbols_menu = ui_utils.MenuBase(self, self.import_function_symbols, "Import function symbols")
 
     def run(self, arg=0):
         """plugin_t run() implementation"""
@@ -87,6 +100,7 @@ class KCPPPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
 
     def activate_plugin(self):
         logging.info("KernelCache CPP plugin was activated")
+        self.activated = True
         logic.init_if_needed()
         self.activate_hooks()
         self.activate_menu.detach_from_menu()
@@ -95,6 +109,7 @@ class KCPPPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
 
     def deactivate_plugin(self):
         logging.info("KernelCache CPP plugin was deactivated")
+        self.activated = False
         self.deactivate_hooks()
         self.deactivate_menu.detach_from_menu()
         self.activate_menu.attach_to_menu()
@@ -125,13 +140,44 @@ class KCPPPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
         finally:
             ida_kernwin.hide_wait_box()
 
+    def export_function_symbols(self):
+        filepath = idaapi.ask_str("function_syms.json", 1, "Enter filename to save symbol list")
+        ida_kernwin.show_wait_box("Exporting symbols...")
+        try:
+            logic.export_function_symbols(filepath)
+        except Exception as e:
+            logic.logger.exception("Exception in export_symbols")
+        finally:
+            ida_kernwin.hide_wait_box()
+
+    def import_function_symbols(self):
+        if not logic.initialized:
+            ida_kernwin.warning('You must perform initial sync first')
+            return
+        
+        filepath = idaapi.ask_file(False, '*', 'Choose symbol map')
+        ida_kernwin.show_wait_box("Importing symbols...")
+        try:
+            self.deactivate_hooks()
+            logic.import_function_symbols(filepath)
+        except Exception as e:
+            logic.logger.exception("Exception in import_symbols")
+        finally:
+            ida_kernwin.hide_wait_box()
+            self.activate_hooks()
+
     def ready_to_run(self):
         """UI_Hooks function.
         Attaches actions to plugin in main menu.
         """
         self.kc_process_idb.attach_to_menu()
         self.initial_sync_menu.attach_to_menu()
-        self.activate_menu.attach_to_menu()
+        if self.activated:
+            self.deactivate_menu.attach_to_menu()
+        else:
+            self.activate_menu.attach_to_menu()
+        self.export_function_symbols_menu.attach_to_menu()
+        self.import_function_symbols_menu.attach_to_menu()
 
         KCPPPlugin.plugin_initialized = True
 
