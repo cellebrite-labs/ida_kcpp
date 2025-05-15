@@ -80,4 +80,4 @@ The same goes for **virutal function prototype changing**. In this case, the rel
 # Meta
 
 Authored by Uriel Malin, Ievgen Solodovnykov and Omer Porzecanski of Cellebrite Labs.
-Developed and tested for IDA8.3 on macOS with python 3.10.2
+Developed and tested for IDA8.4/iOS 18.4 on macOS with python 3.10.2
